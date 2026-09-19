@@ -328,6 +328,9 @@ export const handler = async (event) => {
   } catch (error) {
     const message = String(error?.message || "Internal Server Error");
     const isQuotaError = /quota exceeded|RESOURCE_EXHAUSTED/i.test(message);
+    // This is also used by the Vercel adapter. Log the provider failure there
+    // without ever logging credentials, so production failures are diagnosable.
+    console.error("Chat API error:", message);
     return {
       statusCode: isQuotaError ? 429 : 500,
       headers: corsHeaders,
