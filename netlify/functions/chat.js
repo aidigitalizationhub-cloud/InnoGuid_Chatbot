@@ -52,8 +52,10 @@ const STOP_WORDS = new Set([
   "would",
   "your",
 ]);
-const SOURCE_FETCH_TIMEOUT_MS = 4200;
-const LIVE_CONTEXT_BUDGET_MS = 6500;
+// Keep the whole request below Netlify's synchronous-function time limit.
+const SOURCE_FETCH_TIMEOUT_MS = 1800;
+const GEMINI_TIMEOUT_MS = 7000;
+const DEFAULT_GEMINI_MODEL = "gemini-3.6-flash";
 
 function toContents(history, message) {
   const safeHistory = Array.isArray(history) ? history : [];
@@ -113,16 +115,6 @@ function extractLinksFromHtml(html, baseUrl) {
   return links;
 }
 
-function shouldKeepLink(url, keywords) {
-  const lower = url.toLowerCase();
-  const hasKeyword = keywords.some((kw) => lower.includes(kw));
-  const topical =
-    /news|event|research|program|innovation|hub|institute|department|college|academic|admission|scholarship|publication/.test(
-      lower,
-    );
-  return hasKeyword || topical;
-}
-
 async function fetchSourceSnippet(url, timeoutMs = SOURCE_FETCH_TIMEOUT_MS) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
@@ -152,7 +144,6 @@ async function fetchSourceSnippet(url, timeoutMs = SOURCE_FETCH_TIMEOUT_MS) {
 }
 
 async function buildLiveContext(message) {
-  const startedAt = Date.now();
   const keywords = extractKeywords(message);
   const ranked = SOURCES
     .map((url) => ({ url, score: scoreSource(url, keywords) }))
@@ -160,30 +151,16 @@ async function buildLiveContext(message) {
     .map((item) => item.url);
 
   const shortlist = dedupeUrls([
-    ...ranked.slice(0, 4),
+    ...ranked.slice(0, 2),
     "https://www.iast.ug.edu.gh/",
-    "https://www.ug.edu.gh/news-events",
-  ]).slice(0, 6);
+  ]).slice(0, 3);
 
-  const firstPass = (await Promise.all(shortlist.map((url) => fetchSourceSnippet(url, 3600))))
+  const firstPass = (await Promise.all(shortlist.map((url) => fetchSourceSnippet(url))))
     .filter(Boolean);
 
-  const discoveredLinks = dedupeUrls(
-    firstPass
-      .flatMap((snippet) => snippet.links || [])
-      .filter((link) => shouldKeepLink(link, keywords))
-      .slice(0, 24),
-  );
-
-  let secondPass = [];
-  const elapsed = Date.now() - startedAt;
-  if (elapsed < LIVE_CONTEXT_BUDGET_MS) {
-    const secondPassTargets = discoveredLinks.filter((url) => !shortlist.includes(url)).slice(0, 4);
-    secondPass = (await Promise.all(secondPassTargets.map((url) => fetchSourceSnippet(url, 2500))))
-      .filter(Boolean);
-  }
-
-  const snippets = [...firstPass, ...secondPass].slice(0, 10);
+  // A second crawl pass can consume the remaining function budget. The initial,
+  // ranked pages are sufficient grounding for this synchronous endpoint.
+  const snippets = firstPass.slice(0, 3);
 
   if (!snippets.length) {
     return "No live source snippets were available for this query.";
@@ -198,15 +175,19 @@ async function buildLiveContext(message) {
 
 async function callGemini({ apiKey, model, contents, liveContext, useTools = true }) {
   const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), GEMINI_TIMEOUT_MS);
 
-  const response = await fetch(endpoint, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      contents,
-      systemInstruction: {
-        parts: [
-          {
+  try {
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      signal: controller.signal,
+      body: JSON.stringify({
+        contents,
+          systemInstruction: {
+            parts: [
+              {
             text: `You are InnoGuide, an expert assistant for the University of Ghana and the IAST Virtual Innovation Hub.
 Use these approved sources as grounding references: ${SOURCES.join(", ")}
 
@@ -216,7 +197,7 @@ ${liveContext}
 Response rules:
 1) Give a detailed, accurate answer with clear sections and bullet points.
 2) Prioritize facts from the live context. If a fact is uncertain, state that explicitly.
-3) End with a "Sources" section listing URLs you relied on.
+3) End with a "Sources" section. Each source must be a Markdown link in the form - [Title or URL](https://example.com). Do not use naked URLs.
 4) If the question asks for steps/processes, provide step-by-step guidance.
 5) Do not invent UG programs, offices, names, or dates.
 6) For external/current info, use web context tools and cite URLs.
@@ -230,30 +211,40 @@ Response rules:
         topP: 0.9,
         maxOutputTokens: 1200,
       },
-    }),
-  });
+      }),
+    });
 
-  const data = await response.json();
-  if (!response.ok) {
-    const message = data?.error?.message || `Gemini request failed (${response.status})`;
-    throw new Error(message);
+    const data = await response.json();
+    if (!response.ok) {
+      const message = data?.error?.message || `Gemini request failed (${response.status})`;
+      throw new Error(message);
+    }
+
+    const text = data?.candidates?.[0]?.content?.parts
+      ?.map((p) => p?.text || "")
+      .join("")
+      .trim();
+
+    return text || "";
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      throw new Error(`Gemini request timed out after ${GEMINI_TIMEOUT_MS / 1000} seconds.`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
   }
-
-  const text = data?.candidates?.[0]?.content?.parts
-    ?.map((p) => p?.text || "")
-    .join("")
-    .trim();
-
-  return text || "";
 }
 
 async function callGeminiWithRetry({ apiKey, contents, liveContext, models }) {
   let lastError = null;
 
   for (const model of models) {
-    for (let attempt = 1; attempt <= 2; attempt += 1) {
+    for (let attempt = 1; attempt <= 1; attempt += 1) {
       try {
-        const text = await callGemini({ apiKey, model, contents, liveContext, useTools: true });
+        // Live context is collected above; avoiding a second provider-side tool
+        // call keeps this synchronous function within its time budget.
+        const text = await callGemini({ apiKey, model, contents, liveContext, useTools: false });
         if (text) return { text, model };
         lastError = new Error(`Empty response from model ${model}`);
       } catch (error) {
@@ -272,7 +263,8 @@ async function callGeminiWithRetry({ apiKey, contents, liveContext, models }) {
           lastError = error;
         }
 
-        await new Promise((resolve) => setTimeout(resolve, 350 * attempt));
+        // Do not retry in this synchronous function: each Gemini call has a
+        // bounded 7-second window and a retry would exceed Netlify's budget.
       }
     }
   }
@@ -306,12 +298,10 @@ export const handler = async (event) => {
     const body = JSON.parse(event.body || "{}");
     const message = typeof body.message === "string" ? body.message.trim() : "";
     const history = Array.isArray(body.history) ? body.history : [];
-    const primaryModel = process.env.GEMINI_MODEL || "gemini-2.0-flash";
-    const fallbackModels = dedupeUrls([
-      primaryModel,
-      "gemini-2.0-flash",
-      "gemini-1.5-flash",
-    ]);
+    const primaryModel = process.env.GEMINI_MODEL?.trim() || DEFAULT_GEMINI_MODEL;
+    // If a paid/preview model has no allocation, keep the chat usable with the
+    // stable Flash model instead of failing every request.
+    const fallbackModels = [...new Set([primaryModel, DEFAULT_GEMINI_MODEL])];
 
     if (!message) {
       return {
@@ -336,11 +326,15 @@ export const handler = async (event) => {
       body: JSON.stringify({ text, model }),
     };
   } catch (error) {
+    const message = String(error?.message || "Internal Server Error");
+    const isQuotaError = /quota exceeded|RESOURCE_EXHAUSTED/i.test(message);
     return {
-      statusCode: 500,
+      statusCode: isQuotaError ? 429 : 500,
       headers: corsHeaders,
       body: JSON.stringify({
-        error: error?.message || "Internal Server Error",
+        error: isQuotaError
+          ? "Gemini quota is unavailable for this project. Use GEMINI_MODEL=gemini-3.6-flash, wait for the stated reset time, or enable billing for the API project that owns this key."
+          : message,
       }),
     };
   }

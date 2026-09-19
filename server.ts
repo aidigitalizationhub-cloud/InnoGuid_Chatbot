@@ -30,6 +30,10 @@ const SOURCES = [
   "https://www.ug.edu.gh/about-ug/overview",
 ];
 
+// Pro/preview models can have no free-tier allocation. Flash is the stable,
+// lower-cost default for this public chat endpoint.
+const DEFAULT_GEMINI_MODEL = "gemini-3.6-flash";
+
 function getApiKey() {
   const key = process.env.GEMINI_API_KEY?.trim();
   return key ? key : "";
@@ -48,10 +52,42 @@ function toGeminiContents(history: any[], message: string) {
   return contents;
 }
 
+function isRetryableGeminiError(error: any) {
+  const status = error?.status || error?.error?.code;
+  const message = String(error?.message || "");
+  // A quota-exhausted 429 will not be fixed by retrying milliseconds later.
+  if (status === 429 && /quota exceeded|free.?tier|per.?day/i.test(message)) {
+    return false;
+  }
+  return status === 429 || status === 500 || status === 502 || status === 503 || status === 504 ||
+    /high demand|unavailable|overloaded|temporarily unavailable/i.test(message);
+}
+
+async function generateStreamWithRetry(ai: GoogleGenAI, params: any) {
+  const maxAttempts = 3;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      return await ai.models.generateContentStream(params);
+    } catch (error) {
+      if (!isRetryableGeminiError(error) || attempt === maxAttempts) {
+        throw error;
+      }
+
+      const delayMs = 750 * 2 ** (attempt - 1);
+      console.warn(`Gemini temporarily unavailable; retrying in ${delayMs}ms (attempt ${attempt + 1}/${maxAttempts}).`);
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+
+  throw new Error("Gemini did not return a response.");
+}
+
 async function startServer() {
   const app = express();
   const port = Number(process.env.PORT) || 3000;
-  const model = process.env.GEMINI_MODEL || "gemini-2.0-flash";
+  const requestedModel = process.env.GEMINI_MODEL?.trim() || DEFAULT_GEMINI_MODEL;
+  const models = [...new Set([requestedModel, DEFAULT_GEMINI_MODEL])];
 
   app.use(express.json({ limit: "1mb" }));
 
@@ -78,24 +114,38 @@ async function startServer() {
       const ai = new GoogleGenAI({ apiKey });
       const contents = toGeminiContents(history, message);
 
+      let responseStream: any;
+      let lastError: any;
+      for (const model of models) {
+        try {
+          responseStream = await generateStreamWithRetry(ai, {
+            model,
+            contents,
+            config: {
+              systemInstruction: `You are InnoGuide, an expert assistant for the University of Ghana and the IAST Virtual Innovation Hub.
+If useful, you may use urlContext with these sources: ${SOURCES.join(", ")}
+Be concise, accurate, and use Markdown.
+When you include sources, format them as Markdown links like - [Title or URL](https://example.com). Do not list naked URLs.`,
+              tools: [{ urlContext: {} }],
+              thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+            },
+          });
+          break;
+        } catch (error) {
+          lastError = error;
+        }
+      }
+
+      if (!responseStream) throw lastError || new Error("No Gemini model could generate a response.");
+
+      // Send SSE headers only after Gemini has accepted the request, so retryable
+      // upstream failures can still return a normal HTTP error if all retries fail.
       res.setHeader("Content-Type", "text/event-stream");
       res.setHeader("Cache-Control", "no-cache, no-transform");
       res.setHeader("Connection", "keep-alive");
       res.setHeader("X-Accel-Buffering", "no");
       res.setHeader("X-Content-Type-Options", "nosniff");
       res.flushHeaders();
-
-      const responseStream = await ai.models.generateContentStream({
-        model,
-        contents,
-        config: {
-          systemInstruction: `You are InnoGuide, an expert assistant for the University of Ghana and the IAST Virtual Innovation Hub.
-If useful, you may use urlContext with these sources: ${SOURCES.join(", ")}
-Be concise, accurate, and use Markdown.`,
-          tools: [{ urlContext: {} }],
-          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-        },
-      });
 
       for await (const chunk of responseStream) {
         const text = chunk.text;
@@ -118,6 +168,12 @@ Be concise, accurate, and use Markdown.`,
 
       if (errorMessage.includes("API key not valid") || errorMessage.includes("API_KEY_INVALID")) {
         return res.status(401).json({ error: "Invalid Gemini API key." });
+      }
+
+      if (error?.status === 429 || /quota exceeded|RESOURCE_EXHAUSTED/i.test(errorMessage)) {
+        return res.status(429).json({
+          error: "Gemini quota is unavailable for this project. Use GEMINI_MODEL=gemini-3.6-flash, wait for the stated reset time, or enable billing for the API project that owns this key.",
+        });
       }
 
       res.status(500).json({ error: errorMessage });

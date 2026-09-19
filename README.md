@@ -28,7 +28,7 @@ This project includes:
 
 In Netlify dashboard, set these environment variables:
 - `GEMINI_API_KEY` (required)
-- `GEMINI_MODEL` (optional, default `gemini-2.0-flash`)
+- `GEMINI_MODEL` (optional, default `gemini-3.6-flash`)
 
 Deploy command: `npm run build`  
 Publish directory: `dist`
