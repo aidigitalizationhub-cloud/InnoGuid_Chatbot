@@ -54,7 +54,9 @@ const STOP_WORDS = new Set([
 ]);
 // Keep the whole request below Netlify's synchronous-function time limit.
 const SOURCE_FETCH_TIMEOUT_MS = 1800;
-const GEMINI_TIMEOUT_MS = 7000;
+// URL-grounded Gemini requests can legitimately take longer than a plain-text
+// response. Keep this below the Vercel function limit configured in vercel.json.
+const GEMINI_TIMEOUT_MS = 20000;
 const DEFAULT_GEMINI_MODEL = "gemini-3.6-flash";
 
 function toContents(history, message) {
