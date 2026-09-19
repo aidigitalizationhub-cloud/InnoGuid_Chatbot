@@ -33,6 +33,13 @@ In Netlify dashboard, set these environment variables:
 Deploy command: `npm run build`  
 Publish directory: `dist`
 
+## Vercel deployment
+
+Vercel uses `api/chat.js` for `/api/chat` and `vercel.json` for the Vite SPA
+fallback. Import the GitHub repository, set `GEMINI_API_KEY` and optionally
+`GEMINI_MODEL=gemini-3.6-flash` in Vercel Project Settings → Environment
+Variables, then deploy.
+
 ## Embed in the Virtual Innovation Hub index page
 
 After deploying InnoGuide (example: `https://innoguide.netlify.app`), embed it in your platform:
