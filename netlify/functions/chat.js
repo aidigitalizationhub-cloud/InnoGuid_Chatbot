@@ -243,7 +243,8 @@ async function callGeminiWithRetry({ apiKey, contents, liveContext, models }) {
   let lastError = null;
 
   for (const model of models) {
-    for (let attempt = 1; attempt <= 1; attempt += 1) {
+    const maxAttempts = 3;
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       try {
         // Live context is collected above; avoiding a second provider-side tool
         // call keeps this synchronous function within its time budget.
@@ -254,6 +255,8 @@ async function callGeminiWithRetry({ apiKey, contents, liveContext, models }) {
         const message = String(error?.message || "");
         const unsupportedTool =
           /tools|googleSearch|urlContext|Unknown name|invalid argument/i.test(message);
+        const temporaryProviderError =
+          /high demand|temporarily unavailable|overloaded|unavailable|\b503\b|\b504\b/i.test(message);
 
         if (unsupportedTool) {
           try {
@@ -266,8 +269,16 @@ async function callGeminiWithRetry({ apiKey, contents, liveContext, models }) {
           lastError = error;
         }
 
-        // Do not retry in this synchronous function: each Gemini call has a
-        // bounded 7-second window and a retry would exceed Netlify's budget.
+        // Capacity errors are normally returned immediately. A short, bounded
+        // retry makes the public chat resilient without retrying quota errors.
+        if (temporaryProviderError && attempt < maxAttempts) {
+          const delayMs = 1000 * attempt;
+          console.warn(`Gemini temporarily unavailable; retrying in ${delayMs}ms (attempt ${attempt + 1}/${maxAttempts}).`);
+          await new Promise((resolve) => setTimeout(resolve, delayMs));
+          continue;
+        }
+
+        break;
       }
     }
   }
@@ -331,15 +342,18 @@ export const handler = async (event) => {
   } catch (error) {
     const message = String(error?.message || "Internal Server Error");
     const isQuotaError = /quota exceeded|RESOURCE_EXHAUSTED/i.test(message);
+    const isTemporaryProviderError = /high demand|temporarily unavailable|overloaded|unavailable|\b503\b|\b504\b/i.test(message);
     // This is also used by the Vercel adapter. Log the provider failure there
     // without ever logging credentials, so production failures are diagnosable.
     console.error("Chat API error:", message);
     return {
-      statusCode: isQuotaError ? 429 : 500,
+      statusCode: isQuotaError ? 429 : isTemporaryProviderError ? 503 : 500,
       headers: corsHeaders,
       body: JSON.stringify({
         error: isQuotaError
           ? "Gemini quota is unavailable for this project. Use GEMINI_MODEL=gemini-3.6-flash, wait for the stated reset time, or enable billing for the API project that owns this key."
+          : isTemporaryProviderError
+            ? "Gemini is temporarily busy. Please try your request again in a moment."
           : message,
       }),
     };
